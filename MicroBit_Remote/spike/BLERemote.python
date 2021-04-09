@@ -1,0 +1,212 @@
+from spike import PrimeHub, LightMatrix, Button, StatusLight, ForceSensor, MotionSensor, Speaker, ColorSensor, App, DistanceSensor, Motor, MotorPair
+from spike.control import wait_for_seconds, wait_until, Timer
+
+import utime
+import ubluetooth
+import ubinascii
+import struct
+from micropython import const
+
+
+# Constants of BlueTooth
+_IRQ_CENTRAL_CONNECT                    = const(1 << 0)
+_IRQ_CENTRAL_DISCONNECT                 = const(1 << 1)
+_IRQ_GATTS_WRITE                        = const(1 << 2)
+_IRQ_GATTS_READ_REQUEST                 = const(1 << 3)
+_IRQ_SCAN_RESULT                        = const(1 << 4)
+_IRQ_SCAN_COMPLETE                      = const(1 << 5)
+_IRQ_PERIPHERAL_CONNECT                 = const(1 << 6)
+_IRQ_PERIPHERAL_DISCONNECT              = const(1 << 7)
+_IRQ_GATTC_SERVICE_RESULT               = const(1 << 8)
+_IRQ_GATTC_CHARACTERISTIC_RESULT        = const(1 << 9)
+_IRQ_GATTC_DESCRIPTOR_RESULT            = const(1 << 10)
+_IRQ_GATTC_READ_RESULT                  = const(1 << 11)
+_IRQ_GATTC_WRITE_STATUS                 = const(1 << 12)
+_IRQ_GATTC_NOTIFY                       = const(1 << 13)
+_IRQ_GATTC_INDICATE                     = const(1 << 14)
+
+_NOTIFY_ENABLE      = const(1)
+_INDICATE_ENABLE    = const(2)
+
+_UART_SERVICE_UUID  = ubluetooth.UUID("6e400001-b5a3-f393-e0a9-e50e24dcca9e")
+_UART_RX_UUID       = ubluetooth.UUID("6e400002-b5a3-f393-e0a9-e50e24dcca9e")
+_UART_TX_UUID       = ubluetooth.UUID("6e400003-b5a3-f393-e0a9-e50e24dcca9e")
+
+class BLERemote:
+    """
+    Simple BLE Remote Connection ... 
+    """
+    def __init__(self, hub):
+        self._hub = hub
+        self._ble = ubluetooth.BLE()
+        self._ble.active(True)
+        self._ble.irq(handler=self._irq)
+        self._reset()
+        self._X = 128
+        self._Y = 128
+        self._bA = 0;
+        self._bB = 0;
+        self._bC = 0;
+        self._bD = 0;
+        self._bE = 0;
+        self._bF = 0;
+        self._joy_callback = None
+
+    def _reset(self):
+        self._addr = None
+        self._addr_type = None
+        self._adv_type = None
+        self._services = None
+        self._man_data = None
+        self._name = None
+        self._conn = None
+        self._value_tx = None
+        self._value_rx = None
+        self._start = None
+        self._end = None
+        self._joy_callback = None
+
+    # start scan for ble devices
+    def scan_start(self, timeout):
+        self._ble.gap_scan(timeout, 30000, 30000)
+
+    # stop current scan
+    def scan_stop(self):
+        self._ble.gap_scan(None)
+    
+    # connect to a remote device 
+    def connect(self,addr_type, addr):
+        self._hub.light_matrix.show_image('ANGRY')
+        self._ble.gap_connect(addr_type, addr)
+    
+    # desconnect from remote device 
+    def disconnect(self):
+        self._hub.light_matrix.show_image('ASLEEP')
+        self._ble.gap_disconnect(1025)
+        self._reset()
+
+    def write(self, data):
+        if not self._conn:
+            return
+        if not self._value_tx:
+            return
+        print('write:', data)
+        self._ble.gattc_write(self._conn, self._value_tx, data )
+    
+    def read(self):
+        if not self._conn:
+            return
+        if not self._value_rx:
+            return
+        print('try to read')
+        self._ble.gattc_read(self._conn, self._value_rx)
+
+    def on_joy(self, callback):
+        self._joy_callback = callback
+
+    def _on_data(self, data):
+        c, x, y, buttons = struct.unpack('<BBBB',data)
+        self._X = x
+        self._Y = y
+        self._bA = buttons & 1 != 1
+        self._bB = buttons & 2 != 2
+        self._bC = buttons & 4 != 4
+        self._bD = buttons & 8 != 8
+        self._bE = buttons & 16 != 16
+        self._bF = buttons & 32 != 32
+        if self._joy_callback:
+            self._joy_callback(self._X,self._Y)
+
+    # ble event handler
+    def _irq(self, event, data):
+        # called for every result of a ble scan
+        if event == _IRQ_SCAN_RESULT:
+            print('scan --> addr_type, addr, connectable, rssi, adv_data = data')
+            addr_type, addr, connectable, rssi, adv_data = data
+            print(addr_type, addr, connectable, rssi, adv_data)  
+        
+        # called after a ble scan is finished
+        elif event == _IRQ_SCAN_COMPLETE:
+            print("scan finished!")
+        
+        # called if a peripheral device is connected
+        elif event == _IRQ_PERIPHERAL_CONNECT:
+            conn, addr_type, addr = data
+            self._conn = conn
+            self._ble.gattc_discover_services(self._conn)
+            print("connected peripheral device")            
+
+        # called if a peripheral device is disconnected
+        elif event == _IRQ_PERIPHERAL_DISCONNECT:
+            conn, _, _ = data
+            print("disconnected peripheral device")
+
+        # Connected device returned a service.
+        elif event == _IRQ_GATTC_SERVICE_RESULT:
+            conn, start_handle, end_handle, uuid = data
+            print()
+            if conn == self._conn and uuid == _UART_SERVICE_UUID:
+                self._ble.gattc_discover_characteristics(self._conn, start_handle, end_handle)
+                print("Remote UART Service", conn, start_handle, end_handle, uuid)
+
+        # Connected device returned a characteristic.
+        elif event == _IRQ_GATTC_CHARACTERISTIC_RESULT:
+            conn, def_handle, value_handle, properties, uuid = data
+            print("Got Charachterisitic", conn, def_handle, value_handle, properties, uuid )
+            if conn == self._conn and uuid == _UART_TX_UUID:
+                print("TX-Hanlde:", value_handle)
+                self._value_tx = value_handle
+            if conn == self._conn and uuid == _UART_RX_UUID:
+                print("RX-Hanlde:", value_handle, "Def-Handle:", def_handle, "Prop:", properties )
+                self._value_rx = value_handle
+                print("Subscribe indicate:")
+                self._ble.gattc_write(self._conn, value_handle + 1, struct.pack('<BB',0x02,0x00), 1 )
+                self._hub.light_matrix.show_image('HAPPY')
+
+        # A read completed successfully.
+        elif event == _IRQ_GATTC_READ_RESULT:
+            conn_handle, value_handle, char_data = data
+            if value_handle == self._value_rx:
+                self._on_data(char_data)
+
+        # called on indication
+        elif event == _IRQ_GATTC_INDICATE:
+            conn, value_handle, notify_data = data
+            if value_handle == self._value_rx:
+                print("Indicate")
+                self._ble.gattc_read(self._conn, self._value_rx)
+
+"""
+Main Program starts here ...
+"""
+hub = PrimeHub()
+motor_pair = MotorPair('C', 'D')
+motor_pair.set_stop_action('brake')
+
+def on_joystick(x,y):
+    hub.light_matrix.off()
+    hub.light_matrix.set_pixel(round(x/64), 4-round(y/64))
+    m1 = round(50 * (( y - 128 ) + ( x - 128)) / 128)
+    m2 = round(50 * (( y - 128 ) - ( x - 128)) / 128)
+    motor_pair.start_tank(m1,m2)
+
+remote = BLERemote(hub)
+remote.on_joy(on_joystick)
+remote.connect(1,b'\xec\x8f\xaa\xc1?M')
+
+try:
+    while True:
+        if hub.left_button.was_pressed():
+            utime.sleep_ms(100)
+
+        if hub.right_button.was_pressed():
+            utime.sleep_ms(100)
+
+        utime.sleep_ms(100)
+
+finally:
+    remote.disconnect()
+
+
+
+
